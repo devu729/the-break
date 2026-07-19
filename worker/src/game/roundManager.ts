@@ -22,9 +22,36 @@ import {
  */
 const POST_BREAK_PREDICTION_WINDOW_MINUTES = 5;
 
+/**
+ * `stats` is TxLINE's raw stat-code map, e.g. {"1":0,"2":0,...,"1004":1,...}.
+ * These are opaque numeric codes — we don't have TxLINE's code dictionary
+ * mapped out yet, so we can't reliably pick "corners" or "shots on target"
+ * by name. Previously this just took Object.keys(stats)[0], which meant the
+ * round's outcome was determined by whatever key JSON.stringify happened to
+ * serialize first — completely arbitrary, and in practice it landed on key
+ * "1", which stayed 0 -> 0 across an entire round (a guaranteed push, boring
+ * and not actually testing a live stat).
+ *
+ * Prefer a key whose value is non-zero right now — a much stronger signal
+ * that it's a stat actively in play (something already happened this half)
+ * than an arbitrary zero.
+ */
 function pickStatKey(stats: Record<string, number>): string | null {
   const keys = Object.keys(stats).filter((k) => Number.isFinite(Number(stats[k])));
-  return keys.length > 0 ? keys[0] : null;
+  if (keys.length === 0) return null;
+
+  const nonZeroKeys = keys.filter((k) => Number(stats[k]) !== 0);
+  if (nonZeroKeys.length > 0) {
+    return nonZeroKeys[0];
+  }
+
+  // Nothing has happened yet this half — nothing is a great choice here,
+  // but we still need *something* so the round can open. Falls back to the
+  // first key, same as before, but only as a last resort.
+  console.warn(
+    `[roundManager] pickStatKey: no non-zero stat found, falling back to first key (${keys[0]}).`
+  );
+  return keys[0];
 }
 
 /**

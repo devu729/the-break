@@ -56,6 +56,87 @@ const txlineHttpsAgent = new https.Agent({
 
 const http = axios.create({ httpsAgent: txlineHttpsAgent });
 
+/**
+ * TxLINE's SSE-style endpoint /api/scores/updates/{id} returns
+ * Server-Sent-Events formatted TEXT, not JSON — blocks separated by blank
+ * lines, each with a "data: {...}" line (plus "event:"/"id:" lines we
+ * don't need). Axios has no built-in SSE parsing, so res.data comes back
+ * as one giant raw string unless we force responseType: "text" and parse
+ * it ourselves. This splits it into the individual JSON event objects.
+ *
+ * NOTE: /api/scores/snapshot/{id} does NOT use this format — it returns a
+ * plain JSON array/object as a string. See fetchFixtureStats() below,
+ * which parses that response directly and only falls back to this
+ * function if direct JSON.parse fails.
+ */
+/**
+ * /api/scores/snapshot/{id} (and /api/scores/updates/{id}) both stream a
+ * sequence of incremental diffs ("Action":"action_amend"), not a single
+ * full state — later records only carry the fields that changed at that
+ * tick. To reconstruct a usable baseline we replay all records in order,
+ * deep-merging each on top of the accumulated state, rather than reading
+ * only the last record.
+ */
+function sortRecordsChronologically(records: any[]): any[] {
+  // deepMerge below lets the LAST record in the array win for any given
+  // field, so the array must actually be in chronological order for that
+  // to mean "most recent wins." The API's raw array order isn't
+  // guaranteed to be chronological — we saw Clock.Seconds regress
+  // (e.g. reading ~40:08 right after halftime, when it should be >45:00)
+  // when trusting raw array order. Sort explicitly by timestamp (Ts),
+  // falling back to Seq or Id if Ts is missing, so the merge is
+  // deterministic regardless of what order the API happens to send.
+  return [...records].sort((a, b) => {
+    const aKey = Number(a?.Ts ?? a?.Seq ?? a?.Id ?? 0);
+    const bKey = Number(b?.Ts ?? b?.Seq ?? b?.Id ?? 0);
+    return aKey - bKey;
+  });
+}
+
+function mergeRecords(records: any[]): Record<string, any> {
+  const merged: Record<string, any> = {};
+  const deepMerge = (target: Record<string, any>, source: Record<string, any>) => {
+    for (const key of Object.keys(source)) {
+      const sVal = source[key];
+      if (sVal && typeof sVal === "object" && !Array.isArray(sVal)) {
+        if (!target[key] || typeof target[key] !== "object" || Array.isArray(target[key])) {
+          target[key] = {};
+        }
+        deepMerge(target[key], sVal);
+      } else {
+        target[key] = sVal;
+      }
+    }
+  };
+  for (const record of records) {
+    if (record && typeof record === "object") {
+      deepMerge(merged, record);
+    }
+  }
+  return merged;
+}
+
+function parseSseEvents(raw: string): any[] {
+  const events: any[] = [];
+  const blocks = raw.split(/\r?\n\r?\n+/);
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    let dataPayload = "";
+    for (const line of lines) {
+      if (line.startsWith("data:")) {
+        dataPayload += line.slice(5).trim();
+      }
+    }
+    if (!dataPayload) continue;
+    try {
+      events.push(JSON.parse(dataPayload));
+    } catch {
+      // skip any malformed/partial block rather than crash the whole poll
+    }
+  }
+  return events;
+}
+
 export interface TxLineCredentials {
   jwt: string;
   apiToken: string;
@@ -204,20 +285,71 @@ export class TxLineClient {
       http.get(`${this.apiOrigin}/api/scores/updates/${txlineFixtureId}`, {
         headers: this.authHeaders(),
         timeout: 20_000,
+        responseType: "text",
+        transformResponse: [(data) => data],
       })
     );
-    return Array.isArray(res.data) ? res.data : res.data ? [res.data] : [];
+
+    if (typeof res.data === "string") {
+      return sortRecordsChronologically(parseSseEvents(res.data));
+    }
+    return sortRecordsChronologically(
+      Array.isArray(res.data) ? res.data : res.data ? [res.data] : []
+    );
   }
 
   async fetchFixtureStats(txlineFixtureId: string): Promise<Record<string, number>> {
+    const merged = await this.fetchMergedSnapshot(txlineFixtureId);
+    return merged.Stats ?? merged.stats ?? {};
+  }
+
+  /**
+   * Returns the current StatusId and Clock.Seconds from the same
+   * merge-replayed snapshot used by fetchFixtureStats. This is more
+   * reliable than reading StatusId/Clock off a single raw event from
+   * fetchScoreEvents (the /updates feed), since /updates can lag behind
+   * /snapshot and a single event object may not carry every field.
+   */
+  async fetchMatchState(txlineFixtureId: string): Promise<{ statusId: number; clockSeconds: number }> {
+    const merged = await this.fetchMergedSnapshot(txlineFixtureId);
+    return {
+      statusId: Number(merged.StatusId ?? 0),
+      clockSeconds: Number(merged.Clock?.Seconds ?? 0),
+    };
+  }
+
+  private async fetchMergedSnapshot(txlineFixtureId: string): Promise<Record<string, any>> {
     const res = await this.request(() =>
       http.get(`${this.apiOrigin}/api/scores/snapshot/${txlineFixtureId}`, {
         headers: this.authHeaders(),
         timeout: 20_000,
+        responseType: "text",
+        transformResponse: [(data) => data],
       })
     );
-    const record = Array.isArray(res.data) ? res.data[res.data.length - 1] : res.data;
-    return record?.stats ?? {};
+
+    let records: any[];
+    if (typeof res.data === "string") {
+      // /api/scores/snapshot/{id} returns a plain JSON array/object as a
+      // string, NOT SSE-formatted text like /api/scores/updates/{id}.
+      // Try direct JSON.parse first; only fall back to the SSE parser if
+      // that fails (e.g. if the API ever changes format on us).
+      const trimmed = res.data.trim();
+      if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          records = Array.isArray(parsed) ? parsed : [parsed];
+        } catch {
+          records = parseSseEvents(res.data);
+        }
+      } else {
+        records = parseSseEvents(res.data);
+      }
+    } else {
+      records = Array.isArray(res.data) ? res.data : res.data ? [res.data] : [];
+    }
+
+    return mergeRecords(sortRecordsChronologically(records));
   }
 
   private async request<T>(fn: () => Promise<T>): Promise<T> {

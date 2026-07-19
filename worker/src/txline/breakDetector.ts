@@ -14,6 +14,16 @@ interface TrackedState {
   inBreak: boolean;
   breakStartedAtClockSeconds: number | null;
   lastEventId: string | null;
+  // Clock value (the SAME continuous, never-resetting match clock used in
+  // MatchSnapshot.clockSeconds) observed at the moment this half began.
+  // Needed because clockSeconds does NOT reset to 0 at the start of the
+  // second half — it just keeps counting up from wherever H1 stoppage
+  // time left off. Without this baseline, "minutes into the half" for H2
+  // would be computed from the raw total match clock (e.g. ~47 minutes
+  // right at H2 kickoff), which would already be past
+  // BREAK_MINUTE_THRESHOLD and fire breakStarted immediately at kickoff
+  // instead of near an actual mid-half stoppage.
+  halfStartClockSeconds: number | null;
 }
 
 export const trackedMatches = new Map<string, TrackedState>();
@@ -45,6 +55,7 @@ export function detectBreak(snapshot: MatchSnapshot, events: any[]): DetectResul
     inBreak: false,
     breakStartedAtClockSeconds: null,
     lastEventId: null,
+    halfStartClockSeconds: null,
   };
 
   const result: DetectResult = { breakStarted: false, breakEnded: false, half };
@@ -58,9 +69,14 @@ export function detectBreak(snapshot: MatchSnapshot, events: any[]): DetectResul
     state.half = half;
     state.inBreak = false;
     state.breakStartedAtClockSeconds = null;
+    // Baseline this half's "elapsed" measurement off the clock value we're
+    // seeing right now, since clockSeconds is a continuous match-total
+    // clock, not a per-half clock that resets to 0.
+    state.halfStartClockSeconds = snapshot.clockSeconds;
   }
 
-  const minutesIntoHalf = snapshot.clockSeconds / 60;
+  const halfStartClockSeconds = state.halfStartClockSeconds ?? 0;
+  const minutesIntoHalf = (snapshot.clockSeconds - halfStartClockSeconds) / 60;
   const newEvents = latestUnseenEvents(events, state.lastEventId);
   if (newEvents.length > 0) {
     state.lastEventId = String(newEvents[newEvents.length - 1].id ?? state.lastEventId);

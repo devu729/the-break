@@ -21,8 +21,11 @@ export async function startPolling(client: TxLineClient) {
       const fixtures = await client.fetchFixtures();
 
       const nowSeconds = Date.now() / 1000;
+
+      // TxLINE returns StartTime in MILLISECONDS — divide by 1000 to
+      // compare against nowSeconds (confirmed via earlier debug log).
       const candidateFixtures = (fixtures as any[]).filter((f) => {
-        const startTime = Number(f.StartTime ?? 0);
+        const startTime = Number(f.StartTime ?? 0) / 1000;
         return startTime > 0 && nowSeconds - startTime >= 0 && nowSeconds - startTime <= 3 * 60 * 60;
       });
 
@@ -34,21 +37,47 @@ export async function startPolling(client: TxLineClient) {
         const txlineMatchId = String(raw.FixtureId);
 
         const events = (await client.fetchScoreEvents(txlineMatchId)) as any[];
-        const latestEvent = events[events.length - 1];
-        const phase = String(latestEvent?.statusSoccerId ?? "NS");
+
+        // FIX: StatusId/Clock were previously read off the LAST raw event
+        // in the /updates feed. That feed can lag behind the /snapshot
+        // endpoint, and any single event object may not carry every
+        // field. fetchMatchState() replays ALL records from /snapshot
+        // (same merge logic already proven reliable for fetchFixtureStats)
+        // to reconstruct the current true StatusId/Clock — much more
+        // robust than trusting one possibly-stale event.
+        const { statusId, clockSeconds: realClockSeconds } = await client.fetchMatchState(txlineMatchId);
+
+        // FIX: TxLINE's StatusId convention is now confirmed from observed
+        // data: 2 = first half (live), 3 = halftime, 4 = second half
+        // (live). Previously we only treated statusId 2 as "live" and used
+        // a clock-threshold (<45min = H1) to distinguish halves — that
+        // broke the moment H2 started under statusId 4, since 4 !== 2 and
+        // phase fell back to "NS" no matter what the clock said. Using
+        // statusId directly is authoritative and removes the clock
+        // threshold entirely.
+        let phase = "NS";
+        if (statusId === 2) phase = "H1";
+        else if (statusId === 4) phase = "H2";
+        // statusId 3 (halftime) intentionally falls through to "NS" —
+        // breakDetector treats any non-H1/H2 phase as untracked, which is
+        // what we want during the halftime gap itself.
 
         const snapshot: MatchSnapshot = {
           txlineMatchId,
           homeTeam: raw.Participant1IsHome ? raw.Participant1 : raw.Participant2,
           awayTeam: raw.Participant1IsHome ? raw.Participant2 : raw.Participant1,
           phase,
-          clockSeconds: Math.min(nowSeconds - Number(raw.StartTime ?? nowSeconds), 90 * 60),
+          // Use the REAL match clock from the reconstructed snapshot
+          // state instead of a wall-time approximation — this is exact,
+          // whereas nowSeconds - StartTime drifts with stoppages, VAR
+          // delays, etc. Postgres column is integer, so floor it.
+          clockSeconds: Math.floor(realClockSeconds),
           status: "live",
         };
 
         await upsertMatch(snapshot);
         console.log(
-          `[poller] tick ${tickNum}: wrote match ${txlineMatchId} (${snapshot.homeTeam} vs ${snapshot.awayTeam}, phase ${phase})`
+          `[poller] tick ${tickNum}: wrote match ${txlineMatchId} (${snapshot.homeTeam} vs ${snapshot.awayTeam}, phase ${phase}, statusId ${statusId}, clock ${snapshot.clockSeconds}s)`
         );
 
         const result = detectBreak(snapshot, events);
