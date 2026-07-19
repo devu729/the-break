@@ -9,20 +9,16 @@ import {
 } from "../db/supabaseAdmin.js";
 
 /**
- * DESIGN NOTE — this is the core fix from the hackathon-night redesign:
+ * DESIGN NOTE — updated for hackathon-night redesign #2:
  *
- * Originally, a round opened at the START of the break and resolved at
- * the END of it — i.e. predicting whether a stat would change WHILE PLAY
- * WAS STOPPED. That's a broken bet: since play is paused, the stat
- * almost never moves, so the round was structurally rigged toward
- * "lower" every single time. Real, fair critique, fixed here.
- *
- * New design: the round opens the moment play RESUMES after the break
- * (baseline = live stat right as the whistle goes), and resolves
- * POST_BREAK_PREDICTION_WINDOW_MINUTES later, once real live play has
- * actually happened. That's a genuinely uncertain bet — will a shot,
- * corner, etc. happen in the next few minutes of real play — not a
- * coin flip rigged by dead time.
+ * Round now opens at BREAK START, not on resume. Fans predict Higher/Lower
+ * DURING the dead time of the break itself (baseline = live stat at the
+ * moment the break begins). It still only RESOLVES a few minutes into real
+ * play after the break ends — so the guess is locked in during downtime,
+ * but graded on what actually happens once the game restarts. This avoids
+ * the "rigged toward lower" problem (stat can't move mid-break) while still
+ * giving fans something active to do during the break, which was the whole
+ * point of the product.
  */
 const POST_BREAK_PREDICTION_WINDOW_MINUTES = 5;
 
@@ -31,19 +27,12 @@ function pickStatKey(stats: Record<string, number>): string | null {
   return keys.length > 0 ? keys[0] : null;
 }
 
-/** Break has just started — nothing to open yet, just log it for visibility. */
-export async function onBreakStarted(snapshot: MatchSnapshot, half: 1 | 2) {
-  console.log(
-    `[roundManager] break started for ${snapshot.homeTeam} vs ${snapshot.awayTeam} (half ${half}) — ` +
-      `round will open once play resumes, not now`
-  );
-}
-
 /**
- * Play has just resumed after the break — THIS is when a round opens,
- * baselined on real live stats at the moment of resumption.
+ * Break has just started — THIS is when a round opens now, baselined on
+ * live stats at the moment the break begins, so fans can predict during
+ * the break itself.
  */
-export async function onPlayResumed(snapshot: MatchSnapshot, half: 1 | 2, stats: Record<string, number>) {
+export async function onBreakStarted(snapshot: MatchSnapshot, half: 1 | 2, stats: Record<string, number>) {
   const matchDbId = await getMatchDbId(snapshot.txlineMatchId);
   if (!matchDbId) {
     console.warn(`[roundManager] no matches row yet for ${snapshot.txlineMatchId}, skipping round open`);
@@ -56,7 +45,7 @@ export async function onPlayResumed(snapshot: MatchSnapshot, half: 1 | 2, stats:
   const statKey = pickStatKey(stats);
   if (!statKey) {
     console.warn(
-      `[roundManager] play resumed for ${snapshot.homeTeam} vs ${snapshot.awayTeam} but no usable stat found — skipping round open. Raw stats:`,
+      `[roundManager] break started for ${snapshot.homeTeam} vs ${snapshot.awayTeam} but no usable stat found — skipping round open. Raw stats:`,
       stats
     );
     return;
@@ -73,8 +62,19 @@ export async function onPlayResumed(snapshot: MatchSnapshot, half: 1 | 2, stats:
   });
 
   console.log(
-    `[roundManager] opened round ${roundId} for ${snapshot.homeTeam} vs ${snapshot.awayTeam} ` +
+    `[roundManager] opened round ${roundId} at BREAK START for ${snapshot.homeTeam} vs ${snapshot.awayTeam} ` +
       `(half ${half}, baseline ${statKey}=${baselineValue}, resolves in ${POST_BREAK_PREDICTION_WINDOW_MINUTES}min of real play)`
+  );
+}
+
+/**
+ * Play has resumed after the break. The round already opened at break-start,
+ * so this is now a no-op for round-opening — kept as a hook in case future
+ * logic (e.g. a "play has resumed" UI event) needs it.
+ */
+export async function onPlayResumed(snapshot: MatchSnapshot, half: 1 | 2, stats: Record<string, number>) {
+  console.log(
+    `[roundManager] play resumed for ${snapshot.homeTeam} vs ${snapshot.awayTeam} — round already open from break start, nothing to do here`
   );
 }
 
