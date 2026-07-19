@@ -53,17 +53,17 @@ export async function startPolling(client: TxLineClient) {
 
         const result = detectBreak(snapshot, events);
 
-        // Design (locked in after several iterations): predicting on a
-        // stat DURING the break is a broken bet — play is stopped, so
-        // "will it change" almost always resolves to "no." Instead:
-        //   - breakStarted: just log it, don't open a round yet.
-        //   - breakEnded (= play has just resumed): THIS is when we open
-        //     the round, baselined on real live play, resolving a few
-        //     minutes later once real play has actually happened. See
-        //     roundManager.ts for the resolve-window logic.
+        // Design (updated on hackathon night, redesign #2): the round now
+        // opens at BREAK START, not on resume, so fans can predict Higher/
+        // Lower during the break's dead time itself. Baseline is captured
+        // at break-start; resolution still waits a few minutes into real
+        // play after the break ends (see roundManager.ts for the
+        // resolve-window logic), which keeps the bet fair since the stat
+        // is graded only once real play has actually happened.
         if (result.breakStarted) {
           console.log(`[poller] tick ${tickNum}: BREAK STARTED for ${txlineMatchId}`);
-          await onBreakStarted(snapshot, result.half!);
+          const stats = await client.fetchFixtureStats(snapshot.txlineMatchId);
+          await onBreakStarted(snapshot, result.half!, stats);
         }
         if (result.breakEnded) {
           console.log(`[poller] tick ${tickNum}: break ended (play resumed) for ${txlineMatchId}`);
